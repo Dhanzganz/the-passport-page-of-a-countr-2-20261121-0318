@@ -1,478 +1,482 @@
-#!/usr/bin/env python3
-"""The Passport Page of a Country That Isn't There.
+"""Passport spread of the Republic of Kalvera -- pure-stdlib renderer.
 
-Writes one image, /output/entry.png (1024x1024, deterministic, no network):
-an open passport spread for the invented Republic of Kalvera — data page
-with portrait + machine-readable zone on the left, visa/stamp page on the
-right. Every date is internally consistent: the passport is issued
-12 MAR 2024, expires 11 MAR 2034, and every stamp falls between them in
-chronological order.
+Draws an invented passport (data page + visa page, 1024x1024) using only
+the Python standard library: a small raster canvas, an embedded 5x7
+bitmap font, real ICAO 9303 check digits for the machine-readable zone,
+and a PNG encoder built on zlib + struct. No third-party imports.
 """
 
 import math
 import os
-
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+import struct
+import zlib
 
 W = H = 1024
 
-# ---------------------------------------------------------------- fonts
-def _font(names, size):
-    for name in names:
-        for base in ("/usr/share/fonts/truetype/liberation/",
-                     "/usr/share/fonts/truetype/dejavu/"):
-            path = os.path.join(base, name)
-            if os.path.exists(path):
-                return ImageFont.truetype(path, size)
-    return ImageFont.load_default(size)
+# ---------------------------------------------------------------- canvas
+
+class Canvas:
+    """A minimal RGB raster canvas backed by a bytearray."""
+
+    def __init__(self, w, h, bg):
+        self.w = w
+        self.h = h
+        self.px = bytearray(bytes(bg) * (w * h))
+
+    def rect(self, x, y, w, h, c):
+        x0 = max(0, x)
+        y0 = max(0, y)
+        x1 = min(self.w, x + w)
+        y1 = min(self.h, y + h)
+        if x1 <= x0 or y1 <= y0:
+            return
+        row = bytes(c) * (x1 - x0)
+        n = len(row)
+        for yy in range(y0, y1):
+            i = (yy * self.w + x0) * 3
+            self.px[i:i + n] = row
+
+    def circle(self, cx, cy, r, c):
+        for dy in range(-r, r + 1):
+            dx = int(math.sqrt(r * r - dy * dy))
+            self.rect(cx - dx, cy + dy, 2 * dx + 1, 1, c)
+
+    def ellipse(self, cx, cy, rx, ry, c):
+        if ry <= 0:
+            return
+        for dy in range(-ry, ry + 1):
+            t = 1.0 - (dy / ry) ** 2
+            dx = int(rx * math.sqrt(t)) if t > 0 else 0
+            self.rect(cx - dx, cy + dy, 2 * dx + 1, 1, c)
+
+    def line(self, x0, y0, x1, y1, c, t=1):
+        dx = abs(x1 - x0)
+        dy = -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        x, y = x0, y0
+        off = t // 2
+        while True:
+            self.rect(x - off, y - off, t, t, c)
+            if x == x1 and y == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x += sx
+            if e2 <= dx:
+                err += dx
+                y += sy
+
+    def ring(self, cx, cy, r, c, t=3):
+        steps = int(2 * math.pi * r) + 1
+        off = t // 2
+        for i in range(steps):
+            a = 2 * math.pi * i / steps
+            x = int(cx + r * math.cos(a))
+            y = int(cy + r * math.sin(a))
+            self.rect(x - off, y - off, t, t, c)
+
+    def poly(self, pts, c):
+        ys = [p[1] for p in pts]
+        n = len(pts)
+        for yy in range(min(ys), max(ys) + 1):
+            xs = []
+            for i in range(n):
+                x0, y0 = pts[i]
+                x1, y1 = pts[(i + 1) % n]
+                if (y0 <= yy < y1) or (y1 <= yy < y0):
+                    xs.append(int(x0 + (yy - y0) * (x1 - x0) / (y1 - y0)))
+            xs.sort()
+            for i in range(0, len(xs) - 1, 2):
+                self.rect(xs[i], yy, xs[i + 1] - xs[i] + 1, 1, c)
+
+    def outline(self, x, y, w, h, c, t=2):
+        self.rect(x, y, w, t, c)
+        self.rect(x, y + h - t, w, t, c)
+        self.rect(x, y, t, h, c)
+        self.rect(x + w - t, y, t, h, c)
+
+# ------------------------------------------------------------------ font
+# 5x7 bitmap glyphs, rows top to bottom, '#' = ink.
+
+FONT = {
+    'A': (".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
+    'B': ("####.", "#...#", "#...#", "####.", "#...#", "#...#", "####."),
+    'C': (".###.", "#...#", "#....", "#....", "#....", "#...#", ".###."),
+    'D': ("####.", "#..##", "#...#", "#...#", "#...#", "#..##", "####."),
+    'E': ("#####", "#....", "#....", "####.", "#....", "#....", "#####"),
+    'F': ("#####", "#....", "#....", "####.", "#....", "#....", "#...."),
+    'G': (".###.", "#...#", "#....", "#.###", "#...#", "#...#", ".####"),
+    'H': ("#...#", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
+    'I': (".###.", "..#..", "..#..", "..#..", "..#..", "..#..", ".###."),
+    'J': ("..###", "...#.", "...#.", "...#.", "...#.", "#..#.", ".##.."),
+    'K': ("#...#", "#..#.", "#.#..", "##...", "#.#..", "#..#.", "#...#"),
+    'L': ("#....", "#....", "#....", "#....", "#....", "#....", "#####"),
+    'M': ("#...#", "##.##", "#.#.#", "#.#.#", "#...#", "#...#", "#...#"),
+    'N': ("#...#", "##..#", "#.#.#", "#..##", "#...#", "#...#", "#...#"),
+    'O': (".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
+    'P': ("####.", "#...#", "#...#", "####.", "#....", "#....", "#...."),
+    'Q': (".###.", "#...#", "#...#", "#...#", "#.#.#", "#..#.", ".##.#"),
+    'R': ("####.", "#...#", "#...#", "####.", "#.#..", "#..#.", "#...#"),
+    'S': (".####", "#....", "#....", ".###.", "....#", "....#", "####."),
+    'T': ("#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."),
+    'U': ("#...#", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
+    'V': ("#...#", "#...#", "#...#", "#...#", "#...#", ".#.#.", "..#.."),
+    'W': ("#...#", "#...#", "#...#", "#.#.#", "#.#.#", "#.#.#", ".#.#."),
+    'X': ("#...#", ".#.#.", "..#..", "..#..", "..#..", ".#.#.", "#...#"),
+    'Y': ("#...#", ".#.#.", "..#..", "..#..", "..#..", "..#..", "..#.."),
+    'Z': ("#####", "....#", "...#.", "..#..", ".#...", "#....", "#####"),
+    '0': (".###.", "#..##", "#.#.#", "#.#.#", "##..#", "#...#", ".###."),
+    '1': ("..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."),
+    '2': (".###.", "#...#", "....#", "...#.", "..#..", ".#...", "#####"),
+    '3': ("#####", "...#.", "..#..", "...#.", "....#", "#...#", ".###."),
+    '4': ("...#.", "..##.", ".#.#.", "#..#.", "#####", "...#.", "...#."),
+    '5': ("#####", "#....", "####.", "....#", "....#", "#...#", ".###."),
+    '6': (".##..", ".#...", "#....", "####.", "#...#", "#...#", ".###."),
+    '7': ("#####", "....#", "...#.", "..#..", ".#...", ".#...", ".#..."),
+    '8': (".###.", "#...#", "#...#", ".###.", "#...#", "#...#", ".###."),
+    '9': (".###.", "#...#", "#...#", ".####", "....#", "...#.", ".##.."),
+    ' ': (".....", ".....", ".....", ".....", ".....", ".....", "....."),
+    '.': (".....", ".....", ".....", ".....", ".....", ".##..", ".##.."),
+    ',': (".....", ".....", ".....", ".....", ".##..", ".#...", "#...."),
+    '/': ("....#", "...#.", "...#.", "..#..", ".#...", ".#...", "#...."),
+    '-': (".....", ".....", ".....", ".###.", ".....", ".....", "....."),
+    ':': (".....", ".##..", ".##..", ".....", ".##..", ".##..", "....."),
+    "'": (".#...", ".#...", "#....", ".....", ".....", ".....", "....."),
+    '(': ("...#.", "..#..", ".#...", ".#...", ".#...", "..#..", "...#."),
+    ')': (".#...", "..#..", "...#.", "...#.", "...#.", "..#..", ".#..."),
+    '<': ("...#.", "..#..", ".#...", "#....", ".#...", "..#..", "...#."),
+    '>': (".#...", "..#..", "...#.", "....#", "...#.", "..#..", ".#..."),
+}
 
 
-def serif_b(size):
-    return _font(["LiberationSerif-Bold.ttf", "DejaVuSerif-Bold.ttf"], size)
+def text_w(s, scale, tracking=None):
+    if tracking is None:
+        tracking = scale
+    if not s:
+        return 0
+    return len(s) * (5 * scale + tracking) - tracking
 
 
-def serif(size):
-    return _font(["LiberationSerif-Regular.ttf", "DejaVuSerif.ttf"], size)
-
-
-def sans(size):
-    return _font(["LiberationSans-Regular.ttf", "DejaVuSans.ttf"], size)
-
-
-def sans_b(size):
-    return _font(["LiberationSans-Bold.ttf", "DejaVuSans-Bold.ttf"], size)
-
-
-def mono(size):
-    return _font(["LiberationMono-Regular.ttf", "DejaVuSansMono.ttf"], size)
-
-
-def mono_b(size):
-    return _font(["LiberationMono-Bold.ttf", "DejaVuSansMono-Bold.ttf"], size)
-
-
-# ---------------------------------------------------------------- colours
-INK = (26, 34, 44)          # near-black text
-NAVY = (31, 58, 95)         # official navy
-GOLD = (138, 109, 59)       # rule gold
-PAGE = (247, 243, 232)      # cream page
-PAGE_EDGE = (232, 226, 208)
-DESK = (34, 48, 58)         # dark desk
-DESK2 = (26, 38, 46)
-LABEL = (96, 104, 110)      # small-caps labels
-SKIN = (217, 169, 134)
-SKIN_D = (198, 148, 112)
-HAIR = (58, 42, 34)
-BLAZER = (36, 68, 88)
-SAGE1 = (184, 196, 168)
-SAGE2 = (157, 176, 140)
-
-STAMP_BLUE = (28, 68, 138)
-STAMP_GREEN = (28, 108, 68)
-STAMP_PURPLE = (108, 58, 128)
-STAMP_RED = (148, 58, 48)
-
-
-# ---------------------------------------------------------------- MRZ
-def mrz_check(text):
-    """ICAO 9303 check digit: weights 7,3,1; A=10..Z=35, '<'=0."""
-    total = 0
-    for i, ch in enumerate(text):
-        if ch == "<":
-            v = 0
-        elif ch.isdigit():
-            v = int(ch)
-        else:
-            v = ord(ch) - 55
-        total += v * (7, 3, 1)[i % 3]
-    return str(total % 10)
-
-
-def mrz_check_fields(fields):
-    """Composite check digit: same weights, restarting at 7 for each
-    data element (ICAO 9303 — verified against its worked example,
-    whose composite digit is 0)."""
-    total = 0
-    for field in fields:
-        for i, ch in enumerate(field):
-            if ch == "<":
-                v = 0
-            elif ch.isdigit():
-                v = int(ch)
-            else:
-                v = ord(ch) - 55
-            total += v * (7, 3, 1)[i % 3]
-    return str(total % 10)
-
-
-def build_mrz():
-    # Line 1: P<KVA + VOSS<<ELENA<MARA, padded with '<' to 44.
-    line1 = ("P<KVA" + "VOSS<<ELENA<MARA").ljust(44, "<")
-    doc = "KVA084173"
-    dob = "910704"          # 04 JUL 1991
-    expiry = "340311"       # 11 MAR 2034
-    personal = "<" * 14
-    composite = mrz_check_fields([
-        doc + mrz_check(doc), "KVA", dob + mrz_check(dob), "F",
-        expiry + mrz_check(expiry), personal + mrz_check(personal)])
-    line2 = (doc + mrz_check(doc) + "KVA" + dob + mrz_check(dob)
-             + "F" + expiry + mrz_check(expiry)
-             + personal + mrz_check(personal) + composite)
-    assert len(line1) == 44 and len(line2) == 44, (line1, line2)
-    return line1, line2
-
-
-# ---------------------------------------------------------------- helpers
-def center_text(d, cx, y, text, font, fill):
-    w = d.textlength(text, font=font)
-    d.text((cx - w / 2, y), text, font=font, fill=fill)
-
-
-def spaced_text(d, x, y, text, font, fill, tracking=3):
-    """Draw text with extra letter-spacing (passport headers)."""
+def draw_text(cv, x, y, s, scale, c, tracking=None):
+    if tracking is None:
+        tracking = scale
     cx = x
-    for ch in text:
-        d.text((cx, y), ch, font=font, fill=fill)
-        cx += d.textlength(ch, font=font) + tracking
+    for ch in s.upper():
+        g = FONT.get(ch, FONT[' '])
+        for gy, row in enumerate(g):
+            for gx, bit in enumerate(row):
+                if bit == '#':
+                    cv.rect(cx + gx * scale, y + gy * scale, scale, scale, c)
+        cx += 5 * scale + tracking
     return cx
 
 
-def centered_spaced(d, cx, y, text, font, fill, tracking=3):
-    total = sum(d.textlength(ch, font=font) + tracking for ch in text) - tracking
-    spaced_text(d, cx - total / 2, y, text, font, fill, tracking)
+def draw_centered(cv, center_x, y, s, scale, c, tracking=None):
+    x = center_x - text_w(s, scale, tracking) // 2
+    return draw_text(cv, x, y, s, scale, c, tracking)
 
 
-def field(d, x, y, label, value, vfont=None, label_size=10, value_size=15,
-          width=200):
-    d.text((x, y), label, font=sans(label_size), fill=LABEL)
-    d.text((x, y + 13), value, font=vfont or sans_b(value_size), fill=INK)
+def wrap(s, max_chars):
+    words = s.split()
+    lines = []
+    cur = ""
+    for w_ in words:
+        trial = (cur + " " + w_).strip()
+        if len(trial) <= max_chars:
+            cur = trial
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w_
+    if cur:
+        lines.append(cur)
+    return lines
+
+# ------------------------------------------------------- ICAO 9303 MRZ
+
+_VALS = {str(d): d for d in range(10)}
+_VALS.update({chr(ord('A') + i): 10 + i for i in range(26)})
+_VALS['<'] = 0
 
 
-def circular_text(base, cx, cy, radius, text, font, color, start_deg=-90,
-                  sweep=300, flip=False):
-    """Draw text along a circle, letters rotated tangentially."""
-    layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    ld = ImageDraw.Draw(layer)
-    n = len(text)
-    for i, ch in enumerate(text):
-        ang = math.radians(start_deg + sweep * (i / max(n - 1, 1)))
-        x = cx + radius * math.cos(ang)
-        y = cy + radius * math.sin(ang)
-        glyph = Image.new("RGBA", (40, 40), (0, 0, 0, 0))
-        gd = ImageDraw.Draw(glyph)
-        gd.text((20, 20), ch, font=font, fill=color, anchor="mm")
-        rot = math.degrees(ang) + (90 if not flip else -90)
-        glyph = glyph.rotate(-rot, resample=Image.BICUBIC, center=(20, 20))
-        layer.alpha_composite(glyph, (int(x - 20), int(y - 20)))
-    base.alpha_composite(layer)
+def check_digit(s):
+    total = 0
+    for i, ch in enumerate(s):
+        total += _VALS[ch] * (7, 3, 1)[i % 3]
+    return str(total % 10)
 
 
-def stamp_circle(base, cx, cy, r, top, mid, bottom, color, rotate=0,
-                 alpha=205):
-    """Circular date stamp, drawn on its own layer then rotated."""
-    size = r * 2 + 24
-    layer = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    ld = ImageDraw.Draw(layer)
-    c = size // 2
-    ink = color + (alpha,)
-    ld.ellipse([c - r, c - r, c + r, c + r], outline=ink, width=3)
-    ld.ellipse([c - r + 9, c - r + 9, c + r - 9, c + r - 9],
-               outline=ink, width=1)
-    circular_text(layer, c, c, r - 20, top, sans_b(11), ink,
-                  start_deg=-150, sweep=120)
-    center_text(ld, c, c - 12, mid, sans_b(14), ink)
-    center_text(ld, c, c + 8, bottom, sans_b(13), ink)
-    layer = layer.rotate(rotate, resample=Image.BICUBIC, center=(c, c))
-    base.alpha_composite(layer, (int(cx - size / 2), int(cy - size / 2)))
+def mrz_lines():
+    line1 = "P<KVAVOSS<<ELENA<MARA"
+    line1 = line1 + "<" * (44 - len(line1))
+    doc = "KVA084173"
+    body = (doc + check_digit(doc) + "KVA"
+            + "910704" + check_digit("910704") + "F"
+            + "340311" + check_digit("340311")
+            + "<" * 14 + check_digit("<" * 14))
+    comp_src = body[0:10] + body[13:20] + body[21:28] + body[28:43]
+    line2 = body + check_digit(comp_src)
+    return line1, line2
+
+# ------------------------------------------------------------- drawing
+
+DESK = (64, 56, 48)
+SHADOW = (28, 24, 20)
+PAGE = (243, 238, 224)
+PAGE_LINE = (196, 190, 172)
+GUIL = (216, 221, 231)
+GUIL_R = (230, 230, 220)
+INK = (38, 38, 46)
+GRAY = (110, 106, 96)
+NAVY = (26, 50, 96)
+GOLD = (196, 158, 52)
+TEAL = (24, 92, 104)
+WAVE = (92, 150, 196)
 
 
-def stamp_rect(base, box, lines, color, rotate=0, alpha=200, title_size=15):
-    """Rectangular visa / fee stamp with a double border."""
-    x0, y0, x1, y1 = box
-    w, h = x1 - x0, y1 - y0
-    layer = Image.new("RGBA", (w + 24, h + 24), (0, 0, 0, 0))
-    ld = ImageDraw.Draw(layer)
-    ink = color + (alpha,)
-    ld.rectangle([12, 12, w + 11, h + 11], outline=ink, width=3)
-    ld.rectangle([16, 16, w + 7, h + 7], outline=ink, width=1)
-    cy = 12 + 12
-    for i, (text, size) in enumerate(lines):
-        f = sans_b(size) if i == 0 else sans(size)
-        center_text(ld, (w + 24) // 2, cy, text, f, ink)
-        cy += size + 5
-    layer = layer.rotate(rotate, resample=Image.BICUBIC,
-                         center=((w + 24) // 2, (h + 24) // 2))
-    base.alpha_composite(layer, (x0 - 12, y0 - 12))
+def guilloche(cv, x0, x1, y0, y1, color, step=30):
+    i = 0
+    y = y0
+    while y < y1:
+        prev = None
+        x = x0
+        while x <= x1:
+            yy = y + int(6 * math.sin(x * 0.021 + i * 0.7))
+            if prev is not None:
+                cv.line(prev[0], prev[1], x, yy, color, 1)
+            prev = (x, yy)
+            x += 6
+        y += step
+        i += 1
 
 
-# ---------------------------------------------------------------- portrait
-def draw_portrait(d, x0, y0, w, h):
-    """Stylised flat-illustration passport portrait (drawn, not pasted)."""
-    # backdrop: soft sage gradient
-    for i in range(h):
-        t = i / h
-        col = tuple(int(SAGE1[j] + (SAGE2[j] - SAGE1[j]) * t)
-                    for j in range(3))
-        d.line([(x0, y0 + i), (x0 + w, y0 + i)], fill=col)
-    cx = x0 + w // 2
-    # shoulders / blazer
-    d.pieslice([cx - 78, y0 + h - 78, cx + 78, y0 + h + 60],
-               start=180, end=360, fill=BLAZER)
-    d.polygon([(cx - 26, y0 + h - 40), (cx, y0 + h - 22),
-               (cx + 26, y0 + h - 40), (cx + 14, y0 + h),
-               (cx - 14, y0 + h)], fill=(242, 238, 226))  # shirt V
-    # neck + shadow under chin
-    d.rectangle([cx - 13, y0 + 108, cx + 13, y0 + 138], fill=SKIN_D)
-    d.rectangle([cx - 13, y0 + 108, cx + 13, y0 + 116],
-                fill=(178, 128, 96))
-    # hair back (bob framing the face)
-    d.ellipse([cx - 46, y0 + 8, cx + 46, y0 + 128], fill=HAIR)
+def star_pts(cx, cy, r_out, r_in):
+    pts = []
+    for i in range(10):
+        r = r_out if i % 2 == 0 else r_in
+        a = -math.pi / 2 + i * math.pi / 5
+        pts.append((int(cx + r * math.cos(a)), int(cy + r * math.sin(a))))
+    return pts
+
+
+def coat_of_arms(cv, cx, top):
+    # faint rosette rings behind the shield
+    cv.ring(cx, top + 62, 78, GUIL, 1)
+    cv.ring(cx, top + 62, 92, GUIL, 1)
+    # shield: gold back plate, navy face
+    gold = [(cx - 48, top), (cx + 48, top), (cx + 48, top + 62),
+            (cx, top + 116), (cx - 48, top + 62)]
+    navy = [(cx - 42, top + 6), (cx + 42, top + 6), (cx + 42, top + 60),
+            (cx, top + 106), (cx - 42, top + 60)]
+    cv.poly(gold, GOLD)
+    cv.poly(navy, NAVY)
+    # gold star in the upper field
+    cv.poly(star_pts(cx, top + 36, 19, 8), GOLD)
+    # three reef waves across the lower field
+    for k in range(3):
+        wy = top + 66 + k * 11
+        prev = None
+        x = cx - 32
+        while x <= cx + 32:
+            yy = wy + int(3 * math.sin((x - cx) * 0.16 + k * 0.9))
+            if prev is not None:
+                cv.line(prev[0], prev[1], x, yy, WAVE, 2)
+            prev = (x, yy)
+            x += 4
+
+
+def portrait(cv, x, y, w, h):
+    skin = (233, 196, 161)
+    skin_sh = (214, 172, 134)
+    hair = (82, 56, 38)
+    top_c = (36, 102, 116)
+    cv.rect(x, y, w, h, (172, 192, 203))
+    cx = x + w // 2
+    # hair mass behind the head (bob silhouette)
+    cv.ellipse(cx, y + 74, 52, 58, hair)
+    cv.rect(x + 14, y + 74, 22, 74, hair)
+    cv.rect(x + w - 36, y + 74, 22, 74, hair)
+    # shoulders / blouse
+    cv.poly([(x + 18, y + h), (x + 34, y + 138), (cx, y + 124),
+             (x + w - 34, y + 138), (x + w - 18, y + h)], top_c)
+    # neck
+    cv.rect(cx - 11, y + 104, 22, 26, skin_sh)
     # face
-    d.ellipse([cx - 34, y0 + 22, cx + 34, y0 + 116], fill=SKIN)
-    # fringe: a clean band across the forehead only
-    d.pieslice([cx - 36, y0 + 10, cx + 36, y0 + 58],
-               start=180, end=360, fill=HAIR)
-    d.rectangle([cx - 36, y0 + 30, cx + 36, y0 + 40], fill=HAIR)
-    # side locks of the bob, framing the cheeks
-    d.rounded_rectangle([cx - 42, y0 + 34, cx - 30, y0 + 104],
-                        radius=6, fill=HAIR)
-    d.rounded_rectangle([cx + 30, y0 + 34, cx + 42, y0 + 104],
-                        radius=6, fill=HAIR)
-    # eyebrows: short, straight, neutral
-    d.line([(cx - 23, y0 + 60), (cx - 8, y0 + 59)], fill=HAIR, width=3)
-    d.line([(cx + 8, y0 + 59), (cx + 23, y0 + 60)], fill=HAIR, width=3)
-    # eyes: small, level, neutral
-    for ex in (cx - 16, cx + 16):
-        d.ellipse([ex - 4, y0 + 66, ex + 4, y0 + 73], fill=(38, 30, 26))
-        d.line([(ex - 6, y0 + 65), (ex + 6, y0 + 65)],
-               fill=(38, 30, 26), width=2)
-    # nose + closed, neutral mouth
-    d.line([(cx, y0 + 76), (cx - 2, y0 + 90), (cx + 3, y0 + 92)],
-           fill=SKIN_D, width=2)
-    d.arc([cx - 9, y0 + 96, cx + 9, y0 + 106], start=15, end=165,
-          fill=(168, 92, 84), width=2)
-    # blazer lapels
-    d.line([(cx - 22, y0 + h - 34), (cx, y0 + h - 14)], fill=(24, 48, 64),
-           width=3)
-    d.line([(cx + 22, y0 + h - 34), (cx, y0 + h - 14)], fill=(24, 48, 64),
-           width=3)
+    cv.ellipse(cx, y + 72, 36, 46, skin)
+    # fringe across the forehead
+    cv.ellipse(cx, y + 34, 40, 18, hair)
+    cv.rect(cx - 40, y + 30, 80, 10, hair)
+    # brows, eyes, nose, mouth
+    cv.line(cx - 22, y + 66, cx - 9, y + 64, hair, 2)
+    cv.line(cx + 9, y + 64, cx + 22, y + 66, hair, 2)
+    cv.rect(cx - 19, y + 72, 8, 3, INK)
+    cv.rect(cx + 11, y + 72, 8, 3, INK)
+    cv.line(cx, y + 78, cx - 2, y + 88, skin_sh, 2)
+    cv.line(cx - 9, y + 98, cx + 9, y + 98, (168, 92, 88), 2)
+    # frame
+    cv.outline(x, y, w, h, (90, 88, 80), 2)
 
 
-def draw_emblem(d, cx, y, s=34):
-    """Kalvera arms: shield, eight-point star, three waves."""
-    d.polygon([(cx - s, y), (cx + s, y), (cx + s * 0.82, y + s * 1.05),
-               (cx, y + s * 1.35), (cx - s * 0.82, y + s * 1.05)],
-              outline=NAVY, width=3)
-    d.polygon([(cx - s + 6, y + 5), (cx + s - 6, y + 5),
-               (cx + (s - 6) * 0.82, y + s * 0.95),
-               (cx, y + s * 1.2), (cx - (s - 6) * 0.82, y + s * 0.95)],
-              outline=GOLD, width=1)
-    # eight-point star
-    for k in range(8):
-        a = math.radians(k * 45 - 90)
-        a2 = math.radians(k * 45 - 90 + 22.5)
-        d.line([(cx, y + s * 0.42),
-                (cx + s * 0.30 * math.cos(a), y + s * 0.42 + s * 0.30 * math.sin(a))],
-               fill=GOLD, width=3)
-        d.line([(cx, y + s * 0.42),
-                (cx + s * 0.16 * math.cos(a2), y + s * 0.42 + s * 0.16 * math.sin(a2))],
-               fill=GOLD, width=2)
-    d.ellipse([cx - 4, y + s * 0.36, cx + 4, y + s * 0.48], fill=GOLD)
-    # three waves
-    for j, wy in enumerate((0.72, 0.86, 1.00)):
-        yy = y + s * wy
-        pts = []
-        for t in range(0, 25):
-            px = cx - s * 0.62 + (s * 1.24) * t / 24
-            py = yy + 3 * math.sin(t * math.pi * 2 / 6)
-            pts.append((px, py))
-        d.line(pts, fill=NAVY, width=2)
+def signature(cv, x, y, w, c):
+    prev = None
+    for i in range(w):
+        yy = y + int(9 * math.sin(i * 0.16) + 5 * math.sin(i * 0.05 + 1.3))
+        if prev is not None:
+            cv.line(prev[0], prev[1], x + i, yy, c, 2)
+        prev = (x + i, yy)
+    cv.line(x - 4, y + 20, x + w + 16, y + 13, c, 2)
 
 
-# ---------------------------------------------------------------- pages
-def draw_data_page(img, x0, y0, w, h):
-    d = ImageDraw.Draw(img, "RGBA")
-    # page body
-    d.rectangle([x0, y0, x0 + w, y0 + h], fill=PAGE + (255,))
-    d.rectangle([x0, y0, x0 + w, y0 + h], outline=(120, 110, 88), width=1)
-    # faint guilloche: fine diagonal lines, clipped to the page
-    guil = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    gd = ImageDraw.Draw(guil)
-    for i in range(-h, w, 12):
-        gd.line([(i, h), (i + h, 0)], fill=(190, 200, 210, 20), width=1)
-    img.alpha_composite(guil, (x0, y0))
-    # inner gold rule frame
-    d.rectangle([x0 + 9, y0 + 9, x0 + w - 9, y0 + h - 9],
-                outline=GOLD + (255,), width=1)
-
-    cx = x0 + w // 2
-    # emblem + country
-    draw_emblem(d, cx, y0 + 26, s=30)
-    centered_spaced(d, cx, y0 + 96, "REPUBLIC OF KALVERA",
-                    serif_b(23), NAVY, tracking=2)
-    centered_spaced(d, cx, y0 + 126, "PASSPORT", sans_b(15), INK, tracking=8)
-    center_text(d, cx, y0 + 148, "PASSEPORT", sans(10), LABEL)
-    d.line([(x0 + 30, y0 + 170), (x0 + w - 30, y0 + 170)],
-           fill=NAVY + (255,), width=2)
-
-    # type / code / number row
-    y = y0 + 184
-    cols = [("Type", "P", x0 + 30), ("Code", "KVA", x0 + 150),
-            ("Passport No.", "KVA084173", x0 + 250)]
-    for label, value, fx in cols:
-        d.text((fx, y), label, font=sans(10), fill=LABEL)
-        d.text((fx, y + 13), value, font=sans_b(16), fill=INK)
-    d.line([(x0 + 30, y + 36), (x0 + w - 30, y + 36)],
-           fill=(150, 140, 118, 255), width=1)
-
-    # portrait + signature
-    px, py, pw, ph = x0 + 30, y0 + 244, 150, 185
-    draw_portrait(d, px, py, pw, ph)
-    d.rectangle([px, py, px + pw, py + ph], outline=NAVY + (255,), width=2)
-    sy = py + ph + 12
-    d.text((px, sy), "Signature of bearer", font=sans(9), fill=LABEL)
-    # flowing signature in dark blue ink
-    sig = Image.new("RGBA", (pw, 34), (0, 0, 0, 0))
-    sd = ImageDraw.Draw(sig)
-    pts = [(4 + t, 18 + 6 * math.sin(t / 20.0)) for t in range(0, 141, 3)]
-    sd.line(pts, fill=(30, 50, 110, 235), width=2)
-    pts2 = [(4 + t, 24 + 4 * math.sin(t / 14.0 + 1.5))
-            for t in range(0, 121, 3)]
-    sd.line(pts2, fill=(30, 50, 110, 200), width=1)
-    sd.line([(4, 30), (146, 30)], fill=(30, 50, 110, 200), width=1)
-    img.alpha_composite(sig, (px, sy + 12))
-
-    # personal data fields
-    fx = x0 + 204
-    fy = y0 + 244
-    field(d, fx, fy, "Surname / Nom", "VOSS")
-    field(d, fx, fy + 40, "Given names / Prénoms", "ELENA MARA")
-    field(d, fx, fy + 80, "Nationality / Nationalité", "KALVERAN")
-    field(d, fx, fy + 120, "Date of birth / Date de naissance",
-          "04 JUL 1991")
-    field(d, fx, fy + 160, "Place of birth / Lieu de naissance",
-          "PORT AURELIA")
-    field(d, fx, fy + 200, "Sex / Sexe", "F")
-
-    # issue / expiry / authority
-    y2 = y0 + 496
-    d.text((x0 + 30, y2), "Date of issue / Date de délivrance",
-           font=sans(10), fill=LABEL)
-    d.text((x0 + 30, y2 + 13), "12 MAR 2024", font=sans_b(15), fill=INK)
-    d.text((x0 + 220, y2), "Date of expiry / Date d'expiration",
-           font=sans(10), fill=LABEL)
-    d.text((x0 + 220, y2 + 13), "11 MAR 2034", font=sans_b(15), fill=INK)
-    d.text((x0 + 30, y2 + 40),
-           "Authority / Autorité", font=sans(10), fill=LABEL)
-    d.text((x0 + 30, y2 + 53),
-           "MINISTRY OF THE INTERIOR — PORT AURELIA",
-           font=sans_b(13), fill=INK)
-    d.text((x0 + 30, y2 + 74),
-           "Languages / Langues:  KALVERAN — ENGLISH",
-           font=sans(11), fill=INK)
-    d.line([(x0 + 30, y2 + 94), (x0 + w - 30, y2 + 94)],
-           fill=(150, 140, 118, 255), width=1)
-
-    # machine-readable zone (real ICAO check digits)
-    mrz1, mrz2 = build_mrz()
-    my = y0 + h - 62
-    d.rectangle([x0 + 20, my - 6, x0 + w - 20, my + 44],
-                fill=(255, 255, 255, 255))
-    d.text((x0 + 24, my), mrz1, font=mono(16), fill=INK)
-    d.text((x0 + 24, my + 21), mrz2, font=mono(16), fill=INK)
+def stamp(cv, cx, cy, r, ink, name, kind, date):
+    cv.ring(cx, cy, r, ink, 4)
+    cv.ring(cx, cy, r - 9, ink, 2)
+    # bold name: two passes offset by one pixel
+    draw_centered(cv, cx + 1, cy - 22, name, 1, ink, 1)
+    draw_centered(cv, cx, cy - 22, name, 1, ink, 1)
+    cv.rect(cx - 26, cy - 11, 52, 2, ink)
+    draw_centered(cv, cx, cy - 6, kind, 1, ink, 1)
+    draw_centered(cv, cx, cy + 6, date, 1, ink, 1)
+    cv.rect(cx - 26, cy + 18, 52, 2, ink)
 
 
-def draw_visa_page(img, x0, y0, w, h):
-    d = ImageDraw.Draw(img, "RGBA")
-    d.rectangle([x0, y0, x0 + w, y0 + h], fill=PAGE + (255,))
-    d.rectangle([x0, y0, x0 + w, y0 + h], outline=(120, 110, 88), width=1)
-    d.rectangle([x0 + 9, y0 + 9, x0 + w - 9, y0 + h - 9],
-                outline=GOLD + (255,), width=1)
-    cx = x0 + w // 2
-    centered_spaced(d, cx, y0 + 26, "VISAS", sans_b(16), NAVY, tracking=10)
-    d.line([(x0 + 30, y0 + 52), (x0 + w - 30, y0 + 52)],
-           fill=NAVY + (255,), width=2)
+def left_page(cv):
+    cv.rect(38, 42, 480, 960, SHADOW)
+    cv.rect(28, 32, 480, 960, PAGE)
+    guilloche(cv, 44, 494, 116, 986, GUIL)
+    cv.outline(40, 44, 456, 936, PAGE_LINE, 1)
+    cx = 268
+    draw_centered(cv, cx, 54, "REPUBLIC OF KALVERA", 3, NAVY)
+    draw_centered(cv, cx, 88, "PASSPORT", 2, GRAY, 4)
+    coat_of_arms(cv, cx, 118)
+    # document identifiers
+    draw_text(cv, 62, 252, "TYPE", 1, GRAY)
+    draw_text(cv, 62, 264, "P", 2, INK)
+    draw_text(cv, 150, 252, "CODE", 1, GRAY)
+    draw_text(cv, 150, 264, "KVA", 2, INK)
+    draw_text(cv, 262, 252, "PASSPORT NO.", 1, GRAY)
+    draw_text(cv, 262, 264, "KVA084173", 2, INK)
+    cv.line(60, 292, 476, 292, PAGE_LINE, 1)
+    # portrait + holder block
+    portrait(cv, 60, 306, 150, 190)
+    draw_text(cv, 228, 312, "SIGNATURE OF HOLDER", 1, GRAY)
+    signature(cv, 232, 344, 150, (30, 40, 110))
+    cv.line(228, 380, 470, 380, PAGE_LINE, 1)
+    draw_text(cv, 228, 396, "THIS PASSPORT CONTAINS", 1, GRAY)
+    draw_text(cv, 228, 410, "32 PAGES", 1, GRAY)
+    # gold hologram disc
+    cv.circle(300, 452, 25, GOLD)
+    cv.ring(300, 452, 18, (240, 214, 130), 2)
+    cv.poly(star_pts(300, 452, 11, 5), (240, 214, 130))
+    # data block, two columns then full-width rows
+    fields2 = [
+        ("SURNAME", "VOSS", "GIVEN NAMES", "ELENA MARA"),
+        ("NATIONALITY", "KALVERAN", "SEX", "F"),
+        ("DATE OF BIRTH", "04 JUL 1991", "PLACE OF BIRTH", "PORT AURELIA"),
+        ("DATE OF ISSUE", "12 MAR 2024", "DATE OF EXPIRY", "11 MAR 2034"),
+    ]
+    y = 522
+    for l1, v1, l2, v2 in fields2:
+        draw_text(cv, 60, y, l1, 1, GRAY)
+        draw_text(cv, 60, y + 11, v1, 2, INK)
+        draw_text(cv, 276, y, l2, 1, GRAY)
+        draw_text(cv, 276, y + 11, v2, 2, INK)
+        y += 46
+    for lab, val in [("AUTHORITY", "MINISTRY OF THE INTERIOR"),
+                     ("LANGUAGES", "KALVERAN - ENGLISH")]:
+        draw_text(cv, 60, y, lab, 1, GRAY)
+        draw_text(cv, 60, y + 11, val, 2, INK)
+        y += 46
+    # microprint strip
+    micro = "KALVERA " * 8
+    draw_text(cv, 60, y + 8, micro[:66], 1, (198, 202, 210), 1)
+    draw_text(cv, 60, 838, "ENDORSEMENTS", 1, GRAY)
+    cv.line(60, 856, 476, 856, PAGE_LINE, 1)
+    cv.line(60, 872, 476, 872, PAGE_LINE, 1)
+    # machine-readable zone
+    line1, line2 = mrz_lines()
+    draw_text(cv, 48, 896, line1, 2, INK, 0)
+    draw_text(cv, 48, 928, line2, 2, INK, 0)
+    # page number, bottom outer corner
+    draw_text(cv, 478, 962, "7", 2, GRAY)
 
-    # Tarnovia entry visa (rectangular, top)
-    stamp_rect(img, (x0 + 34, y0 + 72, x0 + w - 34, y0 + 158),
-               [("TARNOVIA — ENTRY VISA", 15),
-                ("Valid 90 days · Single entry", 12),
-                ("Issued 02 JUN 2024 · Port Aurelia Consulate", 12),
-                ("No. TV-2024-1187", 12)],
-               STAMP_BLUE, rotate=-2)
 
-    # circular stamps, two columns
-    stamp_circle(img, x0 + 108, y0 + 248, 62,
-                 "TARNOVIA", "15 JUN 2024", "DEPARTURE",
-                 STAMP_PURPLE, rotate=8)
-    stamp_circle(img, x0 + w - 108, y0 + 248, 62,
-                 "PORT AURELIA", "18 JUN 2024", "ENTRY",
-                 STAMP_GREEN, rotate=-7)
-    stamp_circle(img, x0 + 108, y0 + 386, 62,
-                 "MERROW ISLES", "09 JAN 2025", "ARRIVAL",
-                 STAMP_RED, rotate=-5)
-    stamp_circle(img, x0 + w - 108, y0 + 386, 62,
-                 "MERROW ISLES", "03 FEB 2025", "DEPARTURE",
-                 STAMP_RED, rotate=6)
-    stamp_circle(img, x0 + 108, y0 + 512, 62,
-                 "SABLE COAST", "22 AUG 2025", "ARRIVAL",
-                 STAMP_BLUE, rotate=4)
+def right_page(cv):
+    cv.rect(526, 42, 480, 960, SHADOW)
+    cv.rect(516, 32, 480, 960, PAGE)
+    guilloche(cv, 532, 982, 116, 986, GUIL_R, 34)
+    cv.outline(528, 44, 456, 936, PAGE_LINE, 1)
+    cx = 756
+    draw_centered(cv, cx, 54, "VISAS", 3, NAVY)
+    # Tarnovia entry visa
+    vx, vy, vw, vh = 548, 104, 320, 168
+    cv.rect(vx, vy, vw, vh, (238, 231, 206))
+    cv.outline(vx, vy, vw, vh, TEAL, 3)
+    cv.outline(vx + 7, vy + 7, vw - 14, vh - 14, TEAL, 1)
+    draw_centered(cv, vx + vw // 2, vy + 18, "TARNOVIA", 3, TEAL)
+    draw_centered(cv, vx + vw // 2, vy + 46, "ENTRY VISA", 2, INK)
+    draw_centered(cv, vx + vw // 2, vy + 76, "FROM 02 JUN 2024", 1, INK, 1)
+    draw_centered(cv, vx + vw // 2, vy + 92, "SINGLE ENTRY - 30 DAYS", 1, INK, 1)
+    draw_centered(cv, vx + vw // 2, vy + 108, "VISA NO. TV-2024-08817", 1, INK, 1)
+    draw_centered(cv, vx + vw // 2, vy + 124, "ISSUED AT PORT AURELIA", 1, GRAY, 1)
+    cv.poly(star_pts(vx + vw // 2, vy + 148, 8, 3), TEAL)
+    # entry / exit stamps in chronological order of the journey
+    stamp(cv, 648, 428, 64, (36, 84, 160), "TARNOVIA", "DEPARTURE", "15 JUN 2024")
+    stamp(cv, 856, 306, 58, (110, 60, 150), "KALVERA", "ENTRY", "18 JUN 2024")
+    stamp(cv, 652, 618, 64, (178, 44, 52), "MERROW ISLES", "ARRIVAL", "09 JAN 2025")
+    stamp(cv, 852, 612, 64, (36, 84, 160), "MERROW ISLES", "DEPARTURE", "03 FEB 2025")
+    stamp(cv, 640, 812, 62, (30, 120, 80), "SABLE COAST", "ARRIVAL", "22 AUG 2025")
+    # reef conservation fee stamp
+    fx, fy, fw, fh = 786, 736, 172, 100
+    cv.outline(fx, fy, fw, fh, TEAL, 3)
+    cv.outline(fx + 5, fy + 5, fw - 10, fh - 10, TEAL, 1)
+    draw_centered(cv, fx + fw // 2, fy + 12, "REEF CONSERVATION", 1, TEAL, 1)
+    draw_centered(cv, fx + fw // 2, fy + 28, "FEE PAID", 1, TEAL, 1)
+    draw_centered(cv, fx + fw // 2, fy + 48, "25 KAL", 2, TEAL)
+    # Condition 7 box
+    bx, by, bw, bh = 548, 884, 400, 92
+    cv.outline(bx, by, bw, bh, INK, 2)
+    draw_text(cv, bx + 12, by + 10, "CONDITION 7", 2, INK)
+    en = "REEF PERMIT REQUIRED BEFORE LANDING ON THE NORTHERN ATOLLS."
+    fr = "PERMIS RECIFAL REQUIS AVANT DEBARQUEMENT AUX ATOLLS DU NORD."
+    yy = by + 34
+    for line_ in wrap(en, 62) + wrap(fr, 62):
+        draw_text(cv, bx + 12, yy, line_, 1, INK, 1)
+        yy += 12
+    # page number, bottom outer corner
+    draw_text(cv, 532, 962, "8", 2, GRAY)
 
-    # reef conservation fee stamp (the telling detail)
-    stamp_rect(img, (x0 + 196, y0 + 452, x0 + w - 30, y0 + 566),
-               [("REEF CONSERVATION FEE", 14),
-                ("PAID — 25 KAL", 15),
-                ("PORT AURELIA · 22 AUG 2025", 11)],
-               STAMP_GREEN, rotate=3)
+# -------------------------------------------------------------- PNG out
 
-    # visa condition box (the telling detail, in the document's own words)
-    bx0, by0, bx1, by1 = x0 + 30, y0 + 596, x0 + w - 30, y0 + 676
-    d.rectangle([bx0, by0, bx1, by1], outline=NAVY + (255,), width=1)
-    d.rectangle([bx0 + 3, by0 + 3, bx1 - 3, by1 - 3],
-                outline=(150, 140, 118, 255), width=1)
-    d.text((bx0 + 12, by0 + 8), "CONDITION 7", font=sans_b(11), fill=NAVY)
-    d.text((bx0 + 12, by0 + 24),
-           "Holder must present a reef permit before landing",
-           font=sans(11), fill=INK)
-    d.text((bx0 + 12, by0 + 39),
-           "on the Northern Atolls. Permit office: Port Aurelia.",
-           font=sans(11), fill=INK)
-    d.text((bx0 + 12, by0 + 56),
-           "Le titulaire doit présenter un permis de récif.",
-           font=sans(10), fill=LABEL)
+def png_bytes(cv):
+    raw = bytearray()
+    stride = cv.w * 3
+    for yy in range(cv.h):
+        raw.append(0)
+        i = yy * stride
+        raw += cv.px[i:i + stride]
+    ihdr = struct.pack(">IIBBBBB", cv.w, cv.h, 8, 2, 0, 0, 0)
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+            + chunk(b"IEND", b""))
 
 
-# ---------------------------------------------------------------- main
 def main():
-    img = Image.new("RGBA", (W, H), DESK + (255,))
-    d = ImageDraw.Draw(img, "RGBA")
-    # soft glow behind the spread: one big blurred ellipse, no banding
-    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    gd = ImageDraw.Draw(glow)
-    gd.ellipse([112, 72, 912, 952], fill=(58, 78, 92, 255))
-    glow = glow.filter(ImageFilter.GaussianBlur(90))
-    img.alpha_composite(glow)
-
-    # spread shadow + pages
-    d.rectangle([40, 158, 984, 872], fill=(0, 0, 0, 90))
-    draw_data_page(img, 48, 162, 452, 700)
-    draw_visa_page(img, 524, 162, 452, 700)
-    # spine shadow between the pages
-    sp = Image.new("RGBA", (24, 700), (0, 0, 0, 0))
-    sd = ImageDraw.Draw(sp)
-    for i in range(24):
-        a = int(70 * (1 - abs(i - 11) / 12))
-        sd.line([(i, 0), (i, 700)], fill=(0, 0, 0, a))
-    img.alpha_composite(sp, (500, 162))
-
-    # caption strip under the spread (document label, not a caption)
-    d.text((512, 894), "KVA084173  ·  VOSS, ELENA MARA",
-           font=mono(13), fill=(200, 208, 214), anchor="ma")
-
-    out = os.environ.get("OUTPUT_PATH", "/output/entry.png")
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    img.convert("RGB").save(out, "PNG", optimize=True)
-    print("wrote", out, os.path.getsize(out), "bytes")
+    cv = Canvas(W, H, DESK)
+    left_page(cv)
+    right_page(cv)
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "entry.png"), "wb") as f:
+        f.write(png_bytes(cv))
 
 
 if __name__ == "__main__":
